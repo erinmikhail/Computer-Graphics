@@ -11,6 +11,7 @@ add_executable(${PROJECT_NAME}
 	source/mesh.cpp
 	source/gpu_buffer.cpp
 	source/texture.cpp
+	source/shadow.cpp
 )
 
 if(LINUX)
@@ -119,6 +120,7 @@ if(GLSLC_FOUND)
 	compile_shader(lighting.frag)
 	compile_shader(marker.vert)
 	compile_shader(marker.frag)
+	compile_shader(shadow.vert)
 
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)

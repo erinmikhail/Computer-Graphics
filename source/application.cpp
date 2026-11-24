@@ -17,6 +17,7 @@
 #include "mesh.hpp"
 #include "gpu_buffer.hpp"
 #include "texture.hpp"
+#include "shadow.hpp"
 #include "trajectory.hpp"
 
 #include <imgui.h>
@@ -36,9 +37,11 @@ struct SceneData {
 	uint32_t dir_light_enabled;
 	uint32_t point_light_count;
 	uint32_t spot_light_count;
-	uint32_t padding;
+	uint32_t sun_shadow_enabled;
+	mat4 sun_view_proj;
 };
-static_assert(sizeof(SceneData) == 2 * 64 + 4 * 16 + 16, "SceneData должна совпадать с std140-блоком в scene.glsl");
+static_assert(sizeof(SceneData) == 272, "SceneData должна совпадать с std140-блоком в scene.glsl");
+static_assert(offsetof(SceneData, sun_view_proj) == 208);
 static_assert(offsetof(SceneData, dir_light_enabled) == 192, "счётчики источников идут сразу после четырёх vec4");
 
 struct ObjectData {
@@ -110,6 +113,15 @@ VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
 VkPipeline lit_pipeline = VK_NULL_HANDLE;
 VkPipeline marker_pipeline = VK_NULL_HANDLE;
 VkPipeline line_pipeline = VK_NULL_HANDLE;
+shadow::Renderer shadow_renderer;
+
+struct ShadowSettings {
+	bool sun_enabled = true;
+	float ortho_size = 10.0f;
+	float constant_bias = 2.0f;
+	float slope_bias = 1.5f;
+};
+ShadowSettings shadows;
 
 struct GpuMesh {
 	gpu::Buffer vertices;
@@ -367,6 +379,19 @@ vec3 lightPosition(const Light& light) {
 	return animatedPosition(light.position, light.anim);
 }
 
+vec3 lightUp(vec3 direction) {
+	return std::abs(dot(direction, world_up)) > 0.99f ? vec3{ 0.0f, 0.0f, 1.0f } : world_up;
+}
+
+mat4 sunShadowMatrix() {
+	const vec3 direction = safeDirection(sun.direction);
+	const vec3 center = { 0.0f, room.floor_height + 1.0f, 0.0f };
+	const float distance = room.size + room.wall_height + shadows.ortho_size + 1.0f;
+	const float size = shadows.ortho_size;
+	return ortho(-size, size, -size, size, 0.1f, 2.0f * distance) *
+	       lookAt(center - direction * distance, center, lightUp(direction));
+}
+
 mat4 modelMatrix(const SceneObject& obj) {
 	mat4 path_rotation = identity();
 	if (obj.anim.enabled && obj.anim.orient_along_path) {
@@ -621,6 +646,8 @@ bool createDescriptorSetLayouts() {
 		  .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
 		{ .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
 		  .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+		{ .binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
+		  .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
 	};
 	const VkDescriptorSetLayoutCreateInfo scene_layout_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -664,7 +691,7 @@ bool createDescriptors() {
 		{ .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1 },
 		{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 },
 		{ .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .descriptorCount = material_count },
-		{ .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3 * material_count },
+		{ .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3 * material_count + 1 },
 	};
 	const VkDescriptorPoolCreateInfo pool_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -910,6 +937,20 @@ bool createPipelines() {
 		.depth_write = false,
 	});
 	return lit_pipeline && marker_pipeline && line_pipeline;
+}
+
+bool createShadows() {
+	const VkShaderModule vertex = createShaderModule("shaders/shadow.vert.spv");
+	if (!vertex) return false;
+	const bool ok = shadow_renderer.initialize(vertex);
+	vkDestroyShaderModule(graphics::internal::context.device, vertex, nullptr);
+	if (!ok) {
+		shadow_renderer.destroy();
+		std::cerr << "Failed to create shadow renderer\n";
+		return false;
+	}
+	shadow_renderer.writeDescriptor(scene_descriptor_set, 3, shadow_renderer.sun);
+	return true;
 }
 
 
@@ -1286,13 +1327,24 @@ void drawSelectedObjectUi(SceneObject& obj) {
 	}
 }
 
+void drawShadowUi() {
+	if (!ImGui::CollapsingHeader("Тени", ImGuiTreeNodeFlags_DefaultOpen)) return;
+	ImGui::Checkbox("Тени от солнца", &shadows.sun_enabled);
+	ImGui::SliderFloat("Полуширина проекции солнца", &shadows.ortho_size, 1.0f, 40.0f, "%.1f");
+	ImGui::Text("Площадь проекции: %.1f", 4.0f * shadows.ortho_size * shadows.ortho_size);
+	ImGui::SliderFloat("Depth bias", &shadows.constant_bias, 0.0f, 15.0f, "%.2f");
+	ImGui::SliderFloat("Slope bias", &shadows.slope_bias, 0.0f, 5.0f, "%.2f");
+	ImGui::Text("Shadow map: %u x %u", shadow::resolution, shadow::resolution);
+}
+
 void drawUi() {
 	const ImGuiIO& io = ImGui::GetIO();
 
 	ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_FirstUseEver);
 	ImGui::SetNextWindowSize(ImVec2(390.0f, 600.0f), ImGuiCond_FirstUseEver);
-	if (ImGui::Begin("Лабораторная №3 — Текстурирование")) {
+	if (ImGui::Begin("Лабораторная №4 — Наложение теней")) {
 		ImGui::Text("%.1f FPS", io.Framerate);
+		drawShadowUi();
 		drawCameraUi();
 		drawProjectionUi();
 		drawAmbientUi();
@@ -1404,6 +1456,26 @@ uint32_t countDraws() {
 	return count;
 }
 
+void drawShadowMap(VkCommandBuffer cmd, shadow::Map& map, const mat4& view_proj, bool enabled) {
+	shadow_renderer.begin(cmd, map, shadows.constant_bias, shadows.slope_bias);
+	if (enabled) {
+		bindMesh(cmd, plane_mesh);
+		if (room.floor.visible) {
+			shadow_renderer.draw(cmd, view_proj * floorModelMatrix(), plane_mesh.index_count);
+		}
+		if (room.walls.visible) {
+			for (uint32_t side = 0; side < wall_count; ++side) {
+				shadow_renderer.draw(cmd, view_proj * wallModelMatrix(side), plane_mesh.index_count);
+			}
+		}
+		bindMesh(cmd, cone_mesh);
+		for (const SceneObject& obj : objects) {
+			shadow_renderer.draw(cmd, view_proj * modelMatrix(obj), cone_mesh.index_count);
+		}
+	}
+	shadow_renderer.end(cmd, map);
+}
+
 }
 
 bool initialize(GLFWwindow* app_window) {
@@ -1413,6 +1485,7 @@ bool initialize(GLFWwindow* app_window) {
 	if (!gpu::initialize()) return false;
 	if (!createDescriptors()) return false;
 	if (!createMaterials()) return false;
+	if (!createShadows()) return false;
 	if (!createPipelines()) return false;
 	if (!createMeshes()) return false;
 
@@ -1432,6 +1505,7 @@ void shutdown() {
 	vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
 	vkDestroyDescriptorSetLayout(ctx.device, scene_set_layout, nullptr);
 	vkDestroyDescriptorSetLayout(ctx.device, material_set_layout, nullptr);
+	shadow_renderer.destroy();
 
 	destroyMaterials();
 	gpu::destroyBuffer(object_ubo);
@@ -1490,6 +1564,8 @@ void render(const graphics::internal::FrameData& fd) {
 		.dir_light_enabled = sun.enabled ? 1u : 0u,
 		.point_light_count = uploadPointLights(),
 		.spot_light_count = uploadSpotLights(),
+		.sun_shadow_enabled = sun.enabled && shadows.sun_enabled ? 1u : 0u,
+		.sun_view_proj = sunShadowMatrix(),
 	};
 	gpu::upload(scene_ubo, &scene, sizeof(scene));
 
@@ -1504,6 +1580,7 @@ void render(const graphics::internal::FrameData& fd) {
 	};
 
 	vkBeginCommandBuffer(cmd, &begin);
+	drawShadowMap(cmd, shadow_renderer.sun, scene.sun_view_proj, scene.sun_shadow_enabled != 0);
 
 	VkClearValue clears[2] = {};
 	clears[0].color = {{0.01f, 0.012f, 0.02f, 1.0f}};

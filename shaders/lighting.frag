@@ -26,6 +26,8 @@ layout(std430, set = 0, binding = 2) readonly buffer SpotLightBuffer {
     SpotLight spotLights[];
 };
 
+layout(set = 0, binding = 3) uniform sampler2DShadow sunShadowMap;
+
 layout(set = 1, binding = 1) uniform sampler2D albedoMap;
 layout(set = 1, binding = 2) uniform sampler2D specularMap;
 layout(set = 1, binding = 3) uniform sampler2D emissiveMap;
@@ -105,6 +107,23 @@ float attenuation(float distanceSq) {
     return 1.0 / max(distanceSq, minDistanceSq);
 }
 
+float shadowVisibility(sampler2DShadow depthMap, mat4 lightViewProj, vec3 worldPosition) {
+    vec4 clip = lightViewProj * vec4(worldPosition, 1.0);
+    if (clip.w <= 0.0) return 1.0;
+    vec3 ndc = clip.xyz / clip.w;
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    if (ndc.z <= 0.0 || ndc.z >= 1.0 || any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 1.0;
+
+    vec2 texel = 1.0 / vec2(textureSize(depthMap, 0));
+    float visibility = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            visibility += textureLod(depthMap, vec3(uv + vec2(x, y) * texel, ndc.z), 0.0);
+        }
+    }
+    return visibility / 9.0;
+}
+
 void main() {
     vec3 N = normalize(vWorldNormal);
     vec3 V = normalize(scene.cameraPosition.xyz - vWorldPosition);
@@ -117,7 +136,8 @@ void main() {
 
     if (scene.dirLightEnabled != 0u) {
         vec3 L = normalize(-scene.dirLightDirection.xyz);
-        color += blinnPhong(N, V, L, scene.dirLightColor.rgb * scene.dirLightColor.a, albedo, specularColor);
+        float visibility = scene.sunShadowEnabled != 0u ? shadowVisibility(sunShadowMap, scene.sunViewProj, vWorldPosition) : 1.0;
+        color += visibility * blinnPhong(N, V, L, scene.dirLightColor.rgb * scene.dirLightColor.a, albedo, specularColor);
     }
 
     for (uint i = 0u; i < scene.pointLightCount; ++i) {

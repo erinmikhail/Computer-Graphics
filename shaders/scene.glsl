@@ -8,4 +8,6 @@ layout(set = 0, binding = 0, std140) uniform SceneData {
     uint dirLightEnabled;
     uint pointLightCount;
     uint spotLightCount;
+    uint sunShadowEnabled;
+    mat4 sunViewProj;
 } scene;
