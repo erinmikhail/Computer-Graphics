@@ -7,10 +7,16 @@
 #include <fstream>
 #include <vector>
 #include <iostream>
+#include <random>
+
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
 
 #include "math.hpp"
 #include "cone.hpp"
+#include "mesh.hpp"
 #include "gpu_buffer.hpp"
+#include "texture.hpp"
 #include "trajectory.hpp"
 
 #include <imgui.h>
@@ -20,82 +26,259 @@ namespace application {
 
 namespace {
 
-struct UniformData {
-	alignas(16) mat4 model;  // local → world
-	alignas(16) mat4 view;   // world → камера
-	alignas(16) mat4 proj;   // камера → clip space
-	alignas(16) vec4 color;  // цвет объекта из UI (уже в линейном пространстве)
-	alignas(16) vec4 params; // x = 1 — умножать на процедурные цвета вершин, 0 — нет
+struct SceneData {
+	mat4 view;
+	mat4 proj;
+	vec4 camera_position;
+	vec4 ambient;
+	vec4 dir_light_direction;
+	vec4 dir_light_color;
+	uint32_t dir_light_enabled;
+	uint32_t point_light_count;
+	uint32_t spot_light_count;
+	uint32_t padding;
 };
-static_assert(sizeof(UniformData) == 3 * 64 + 2 * 16, "UniformData должна совпадать с std140-блоком в шейдере");
+static_assert(sizeof(SceneData) == 2 * 64 + 4 * 16 + 16, "SceneData должна совпадать с std140-блоком в scene.glsl");
+static_assert(offsetof(SceneData, dir_light_enabled) == 192, "счётчики источников идут сразу после четырёх vec4");
+
+struct ObjectData {
+	mat4 model;
+	vec4 normal_matrix[3];
+	vec4 albedo;
+	vec4 specular;
+	vec4 uv_scale_emission;
+};
+static_assert(sizeof(ObjectData) == 64 + 3 * 16 + 3 * 16, "ObjectData должна совпадать с std140-блоком в object.glsl");
+
+struct GpuPointLight {
+	vec4 position;
+	vec4 color;
+};
+static_assert(sizeof(GpuPointLight) == 32, "GpuPointLight должна совпадать с std430-структурой PointLight");
+
+struct GpuSpotLight {
+	vec4 position;
+	vec4 direction;
+	vec4 color;
+	float cos_inner;
+	float cos_outer;
+	float padding[2];
+};
+static_assert(sizeof(GpuSpotLight) == 64, "GpuSpotLight должна совпадать с std430-структурой SpotLight");
+static_assert(offsetof(GpuSpotLight, cos_inner) == 48, "cosInner идёт сразу после трёх vec4");
+
+struct SamplingPushConstants {
+	uint32_t enabled;
+	float time;
+	float distortion;
+	float layer_mix;
+	uint32_t seed;
+};
+static_assert(sizeof(SamplingPushConstants) <= 128, "гарантированный минимум maxPushConstantsSize — 128 байт");
+
+struct MaterialFiles {
+	const char* name;
+	const char* albedo;
+	const char* specular;
+	const char* emissive;
+};
+
+const MaterialFiles material_files[] = {
+	{ "Кирпич",               "textures/brick_albedo.png",   "textures/brick_specular.png",  nullptr },
+	{ "Деревянный пол",       "textures/wood_albedo.png",    "textures/wood_specular.png",   nullptr },
+	{ "Металлические панели", "textures/panel_albedo.png",   "textures/panel_specular.png",  "textures/panel_emissive.png" },
+	{ "Лава",                 "textures/lava_albedo.png",    "textures/lava_specular.png",   "textures/lava_emissive.png" },
+	{ "Шахматка",             "textures/checker_albedo.png", nullptr,                        nullptr },
+	{ "Мрамор",               "textures/marble_albedo.png",  "textures/marble_specular.png", nullptr },
+};
+constexpr uint32_t material_count = uint32_t(std::size(material_files));
+
+enum MaterialId : int { Brick, Wood, Panels, Lava, Checker, Marble };
+
+constexpr uint32_t wall_count = 4;
+
+constexpr vec3 world_up = { 0.0f, 1.0f, 0.0f };
 
 
-constexpr uint32_t max_objects = 16;
+GLFWwindow* window = nullptr;
 
-
-VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-VkPipeline pipeline = VK_NULL_HANDLE;
-
-VkDescriptorSetLayout descriptor_set_layout = VK_NULL_HANDLE;
+VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;
+VkDescriptorSetLayout material_set_layout = VK_NULL_HANDLE;
 VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 
-// Геометрия конуса общая для всех объектов: объекты отличаются только своим UBO.
-gpu::Buffer vertex_buffer;
-gpu::Buffer index_buffer;
-uint32_t index_count = 0;
+VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+VkPipeline lit_pipeline = VK_NULL_HANDLE;
+VkPipeline marker_pipeline = VK_NULL_HANDLE;
+VkPipeline line_pipeline = VK_NULL_HANDLE;
+
+struct GpuMesh {
+	gpu::Buffer vertices;
+	gpu::Buffer indices;
+	uint32_t index_count = 0;
+};
+
+GpuMesh cone_mesh;
+GpuMesh plane_mesh;
+GpuMesh cube_mesh;
+GpuMesh spot_wire_mesh;
 
 
-struct ObjectSlot {
-	gpu::Buffer ubo;
+gpu::Buffer object_ubo;
+uint32_t object_capacity = 0;
+VkDeviceSize object_stride = 0;
+uint32_t next_object_index = 0;
+
+struct GpuMaterial {
+	texture::Texture albedo;
+	texture::Texture specular;
+	texture::Texture emissive;
 	VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
 };
-ObjectSlot slots[max_objects];
-std::vector<uint32_t> free_slots;
+GpuMaterial materials[material_count];
+texture::Texture black_texture;
+texture::Texture white_texture;
+VkSampler sampler = VK_NULL_HANDLE;
+
+struct LightBuffer {
+	gpu::Buffer buffer;
+	uint32_t capacity = 0;
+};
+
+VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;
+gpu::Buffer scene_ubo;
+LightBuffer point_light_buffer;
+LightBuffer spot_light_buffer;
+
+
+struct Material {
+	int texture = Checker;
+	vec3 albedo = { 1.0f, 1.0f, 1.0f };
+	vec3 specular = { 0.5f, 0.5f, 0.5f };
+	float shininess = 32.0f;
+	float emission = 1.0f;
+};
 
 struct Animation {
-	bool enabled = false;      // двигается ли объект по траектории вообще
-	bool playing = true;       // Play / Pause
-	float speed = 1.0f;        // множитель скорости ( + отрицательный)
-	bool orient_along_path = false; // поворачивать конус вершиной по направлению движения
+	bool enabled = false;
+	bool playing = true;
+	float speed = 1.0f;
+	bool orient_along_path = false;
 	trajectory::Params path;
-	float time = 0.0f;         // собственное "время анимации" объекта
+	float time = 0.0f;
 };
 
 struct SceneObject {
 	char name[32] = {};
-	uint32_t slot = 0;
 
 	vec3 position = { 0.0f, 0.0f, 0.0f };
 	vec3 rotation_deg = { 0.0f, 0.0f, 0.0f };
 	vec3 scale = { 1.0f, 1.0f, 1.0f };
 
-	vec3 color = { 1.0f, 1.0f, 1.0f }; 
-	bool procedural_colors = true;
+	Material material;
 
 	Animation anim;
+
+	bool special_sampling = false;
+	uint32_t sampling_seed = 0;
 };
 
 std::vector<SceneObject> objects;
-int selected = -1;
+int selected_object = -1;
 int next_object_number = 1;
 
-// Орбитальная камера
+struct Surface {
+	bool visible = true;
+	Material material;
+	float tile_size = 2.0f;
+};
+
+struct Room {
+	float size = 16.0f;
+	float floor_height = -0.5f;
+	float wall_height = 5.0f;
+	Surface floor;
+	Surface walls;
+};
+Room room;
+
+struct SamplingEffect {
+	bool playing = true;
+	float speed = 1.0f;
+	float distortion = 0.02f;
+	float layer_mix = 0.6f;
+	float time = 0.0f;
+};
+SamplingEffect sampling_effect;
+
 struct Camera {
-	float yaw_deg = 35.0f;
-	float pitch_deg = 25.0f;
-	float distance = 5.0f;
-	vec3 target = { 0.0f, 0.0f, 0.0f };
+	vec3 position = { 0.0f, 2.5f, 7.5f };
+	float yaw_deg = 0.0f;
+	float pitch_deg = -18.0f;
+	float move_speed = 3.0f;
+	float mouse_sensitivity = 0.15f;
 };
 Camera camera;
+
+bool mouse_look = false;
+double last_cursor_x = 0.0;
+double last_cursor_y = 0.0;
 
 struct Projection {
 	bool perspective = true;
 	float fov_deg = 60.0f;
 	float near_plane = 0.1f;
 	float far_plane = 100.0f;
-	float ortho_size = 2.0f; 
+	float ortho_size = 2.0f;
 };
 Projection projection;
+
+struct AmbientLight {
+	vec3 color = { 0.6f, 0.7f, 1.0f };
+	float intensity = 0.06f;
+};
+AmbientLight ambient;
+
+struct DirectionalLight {
+	bool enabled = true;
+	vec3 direction = { -0.4f, -1.0f, -0.3f };
+	vec3 color = { 1.0f, 0.95f, 0.85f };
+	float intensity = 0.35f;
+};
+DirectionalLight sun;
+
+struct PointLight {
+	char name[32] = {};
+	vec3 position = { 0.0f, 1.5f, 0.0f };
+	vec3 color = { 1.0f, 1.0f, 1.0f };
+	float intensity = 4.0f;
+	Animation anim;
+};
+
+struct SpotLight {
+	char name[32] = {};
+	vec3 position = { 0.0f, 3.0f, 0.0f };
+	vec3 direction = { 0.0f, -1.0f, 0.0f };
+	vec3 color = { 1.0f, 1.0f, 1.0f };
+	float intensity = 20.0f;
+	float inner_deg = 15.0f;
+	float outer_deg = 25.0f;
+	Animation anim;
+};
+
+std::vector<PointLight> point_lights;
+int selected_point_light = -1;
+int next_point_light_number = 1;
+
+std::vector<SpotLight> spot_lights;
+int selected_spot_light = -1;
+int next_spot_light_number = 1;
+
+struct LightVisualization {
+	bool enabled = true;
+	float marker_size = 0.12f;
+	float spot_length = 1.5f;
+};
+LightVisualization light_viz;
 
 cone::Params cone_params;
 
@@ -124,8 +307,8 @@ VkShaderModule createShaderModule(const char* path){
 
 	const VkShaderModuleCreateInfo info = {
 		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-		.codeSize = code.size(), // байт
-		.pCode = reinterpret_cast<const uint32_t*>(code.data()), // SPIr-V — массив 32-бит слов
+		.codeSize = code.size(),
+		.pCode = reinterpret_cast<const uint32_t*>(code.data()),
 	};
 
 	VkShaderModule module = VK_NULL_HANDLE;
@@ -138,19 +321,31 @@ float srgbToLinear(float c) {
 	return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
 }
 
+vec3 srgbToLinear(vec3 c) {
+	return { srgbToLinear(c.x), srgbToLinear(c.y), srgbToLinear(c.z) };
+}
+
+vec3 safeDirection(vec3 v) {
+	const float len = length(v);
+	return len > 1e-6f ? v * (1.0f / len) : vec3{ 0.0f, -1.0f, 0.0f };
+}
+
 
 mat4 rotationFromEuler(vec3 deg) {
 	return rotateZ(radians(deg.z)) * rotateY(radians(deg.y)) * rotateX(radians(deg.x));
 }
 
 
-vec3 cameraEye() {
+vec3 cameraForward() {
 	const float yaw = radians(camera.yaw_deg);
 	const float pitch = radians(camera.pitch_deg);
-	const vec3 offset = { std::cos(pitch) * std::sin(yaw),
-	                      std::sin(pitch),
-	                      std::cos(pitch) * std::cos(yaw) };
-	return camera.target + offset * camera.distance;
+	return { std::cos(pitch) * std::sin(yaw),
+	         std::sin(pitch),
+	        -std::cos(pitch) * std::cos(yaw) };
+}
+
+mat4 viewMatrix() {
+	return lookAt(camera.position, camera.position + cameraForward(), world_up);
 }
 
 mat4 projectionMatrix(float aspect) {
@@ -163,63 +358,154 @@ mat4 projectionMatrix(float aspect) {
 	return ortho(-w, w, -h, h, projection.near_plane, projection.far_plane);
 }
 
-// Model = T * R * S: сначала масштаб, потом поворот, потом перенос 
-mat4 modelMatrix(const SceneObject& obj) {
-	vec3 position = obj.position;
-	mat4 path_rotation = identity();
-
-	if (obj.anim.enabled) {
-		position = position + trajectory::evaluate(obj.anim.path, obj.anim.time);
-		if (obj.anim.orient_along_path) {
-			path_rotation = trajectory::orientationAlongPath(obj.anim.path, obj.anim.time);
-		}
-	}
-
-	// Поворот по траектории применяется после поворота из UI
-	return translate(position) * path_rotation * rotationFromEuler(obj.rotation_deg) * scale(obj.scale);
+vec3 animatedPosition(vec3 base, const Animation& anim) {
+	return anim.enabled ? base + trajectory::evaluate(anim.path, anim.time) : base;
 }
 
-bool addObject() {
-	if (free_slots.empty()) return false;
+template <typename Light>
+vec3 lightPosition(const Light& light) {
+	return animatedPosition(light.position, light.anim);
+}
 
+mat4 modelMatrix(const SceneObject& obj) {
+	mat4 path_rotation = identity();
+	if (obj.anim.enabled && obj.anim.orient_along_path) {
+		path_rotation = trajectory::orientationAlongPath(obj.anim.path, obj.anim.time);
+	}
+
+	return translate(animatedPosition(obj.position, obj.anim)) * path_rotation *
+	       rotationFromEuler(obj.rotation_deg) * scale(obj.scale);
+}
+
+mat4 floorModelMatrix() {
+	return translate({ 0.0f, room.floor_height, 0.0f }) * scale({ room.size, 1.0f, room.size });
+}
+
+mat4 wallModelMatrix(uint32_t side) {
+	const float half = room.size * 0.5f;
+	return rotateY(radians(90.0f * float(side))) *
+	       translate({ 0.0f, room.floor_height + room.wall_height * 0.5f, -half }) *
+	       rotateX(radians(90.0f)) * scale({ room.size, 1.0f, room.wall_height });
+}
+
+mat4 spotWireModelMatrix(const SpotLight& light, float angle_deg) {
+	const float wire_length = light_viz.spot_length;
+	const float radius = wire_length * std::tan(radians(angle_deg));
+	return translate(lightPosition(light)) * orientY(safeDirection(light.direction)) *
+	       scale({ radius, wire_length, radius });
+}
+
+ObjectData makeObjectData(const mat4& model, const Material& material, float uv_scale_u = 1.0f, float uv_scale_v = 1.0f) {
+	const mat3 normal = normalMatrix(model);
+	return {
+		.model = model,
+		.normal_matrix = { toVec4(normal.c[0], 0.0f), toVec4(normal.c[1], 0.0f), toVec4(normal.c[2], 0.0f) },
+		.albedo = toVec4(srgbToLinear(material.albedo), 1.0f),
+		.specular = toVec4(srgbToLinear(material.specular), material.shininess),
+		.uv_scale_emission = { uv_scale_u, uv_scale_v, material.emission, 0.0f },
+	};
+}
+
+ObjectData makeMarkerData(const mat4& model, vec3 color) {
+	return { .model = model, .albedo = toVec4(color, 1.0f) };
+}
+
+
+void addObject() {
+	
 	SceneObject obj;
-	obj.slot = free_slots.back();
-	free_slots.pop_back();
+	static std::mt19937 generator{std::random_device{}()};
+	obj.sampling_seed = generator();
 	std::snprintf(obj.name, sizeof(obj.name), "Конус %d", next_object_number++);
 
 	const int n = int(objects.size());
 	obj.position = { float(n % 4) * 1.5f - 2.25f, 0.0f, -float(n / 4) * 1.5f };
 
 	objects.push_back(obj);
-	selected = int(objects.size()) - 1;
-	return true;
+	selected_object = int(objects.size()) - 1;
 }
 
 void removeObject(int index) {
 	if (index < 0 || index >= int(objects.size())) return;
-	free_slots.push_back(objects[index].slot);
 	objects.erase(objects.begin() + index);
-	selected = std::min(selected, int(objects.size()) - 1);
+	selected_object = std::min(selected_object, int(objects.size()) - 1);
+}
+
+PointLight& addPointLight() {
+	PointLight light;
+	std::snprintf(light.name, sizeof(light.name), "Точечный %d", next_point_light_number++);
+	point_lights.push_back(light);
+	selected_point_light = int(point_lights.size()) - 1;
+	return point_lights.back();
+}
+
+SpotLight& addSpotLight() {
+	SpotLight light;
+	std::snprintf(light.name, sizeof(light.name), "Прожектор %d", next_spot_light_number++);
+	spot_lights.push_back(light);
+	selected_spot_light = int(spot_lights.size()) - 1;
+	return spot_lights.back();
+}
+
+template <typename T>
+void removeSelected(std::vector<T>& items, int& selected) {
+	if (selected < 0 || selected >= int(items.size())) return;
+	items.erase(items.begin() + selected);
+	selected = std::min(selected, int(items.size()) - 1);
 }
 
 
 void createDefaultScene() {
-	addObject();
-	objects[0].position = { 0.0f, 0.0f, 0.0f };
+	room.floor.material = { .texture = Wood, .specular = { 0.6f, 0.6f, 0.6f }, .shininess = 48.0f };
+	room.walls.material = { .texture = Brick, .specular = { 0.4f, 0.4f, 0.4f }, .shininess = 16.0f };
+	room.walls.tile_size = 3.0f;
 
 	addObject();
-	SceneObject& flyer = objects[1];
-	flyer.position = { 0.0f, 0.0f, 0.0f };
+	SceneObject& plastic = objects.back();
+	plastic.position = { -1.3f, 0.0f, 0.0f };
+	plastic.material = { .texture = Checker, .specular = { 0.9f, 0.9f, 0.9f }, .shininess = 64.0f };
+	plastic.special_sampling = true;
+
+	addObject();
+	SceneObject& gold = objects.back();
+	gold.position = { 1.3f, 0.15f, -0.4f };
+	gold.scale = { 1.3f, 1.3f, 1.3f };
+	gold.material = { .texture = Panels, .albedo = { 0.95f, 0.75f, 0.4f }, .specular = { 1.0f, 0.85f, 0.5f }, .shininess = 200.0f };
+
+	addObject();
+	SceneObject& flyer = objects.back();
+	flyer.position = { 0.0f, 1.6f, 0.0f };
 	flyer.scale = { 0.35f, 0.35f, 0.35f };
-	flyer.color = { 1.0f, 0.6f, 0.2f };
-	flyer.procedural_colors = false;
+	flyer.material = { .texture = Lava, .specular = { 0.3f, 0.3f, 0.3f }, .shininess = 8.0f, .emission = 2.0f };
 	flyer.anim.enabled = true;
 	flyer.anim.orient_along_path = true;
 	flyer.anim.path.type = trajectory::Type::Trefoil;
 	flyer.anim.path.radius = 2.0f;
 	flyer.anim.path.freq_a = 0.6f;
 
-	selected = 0;
+	selected_object = 0;
+
+	PointLight& orbiting = addPointLight();
+	orbiting.position = { 0.0f, 0.9f, 0.0f };
+	orbiting.color = { 1.0f, 0.45f, 0.15f };
+	orbiting.intensity = 4.0f;
+	orbiting.anim.enabled = true;
+	orbiting.anim.path.type = trajectory::Type::Circle;
+	orbiting.anim.path.radius = 2.6f;
+	orbiting.anim.path.freq_a = 0.7f;
+
+	PointLight& cold = addPointLight();
+	cold.position = { -2.5f, 1.2f, -2.0f };
+	cold.color = { 0.2f, 0.6f, 1.0f };
+	cold.intensity = 3.0f;
+
+	SpotLight& spot = addSpotLight();
+	spot.position = { 2.5f, 3.5f, 2.5f };
+	spot.direction = { -2.5f, -4.0f, -2.5f };
+	spot.color = { 1.0f, 0.95f, 0.8f };
+	spot.intensity = 25.0f;
+	spot.inner_deg = 12.0f;
+	spot.outer_deg = 22.0f;
 }
 
 
@@ -242,92 +528,249 @@ void loadUiFont() {
 
 
 
-bool createDescriptors() {
+void writeBufferDescriptor(VkDescriptorSet set, uint32_t binding, VkDescriptorType type, VkBuffer buffer,
+                           VkDeviceSize range = VK_WHOLE_SIZE) {
+	const VkDescriptorBufferInfo buffer_info = {
+		.buffer = buffer,
+		.offset = 0,
+		.range = range,
+	};
+	const VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = set,
+		.dstBinding = binding,
+		.dstArrayElement = 0,
+		.descriptorCount = 1,
+		.descriptorType = type,
+		.pBufferInfo = &buffer_info,
+	};
+	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+}
+
+void writeImageDescriptor(VkDescriptorSet set, uint32_t binding, VkImageView view) {
+	const VkDescriptorImageInfo image_info = {
+		.sampler = sampler,
+		.imageView = view,
+		.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	const VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = set,
+		.dstBinding = binding,
+		.dstArrayElement = 0,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.pImageInfo = &image_info,
+	};
+	vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+}
+
+bool allocateDescriptorSet(VkDescriptorSetLayout layout, VkDescriptorSet& out) {
+	const VkDescriptorSetAllocateInfo alloc_info = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = descriptor_pool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = &layout,
+	};
+	if (vkAllocateDescriptorSets(graphics::internal::context.device, &alloc_info, &out) != VK_SUCCESS) {
+		std::cerr << "Failed to allocate descriptor set\n";
+		return false;
+	}
+	return true;
+}
+
+void reserveLightBuffer(LightBuffer& lights, uint32_t count, VkDeviceSize element_size, uint32_t binding) {
+	if (lights.buffer.buffer != VK_NULL_HANDLE && count <= lights.capacity) return;
+
+	const uint32_t capacity = std::max({ 1u, count, lights.capacity * 2 });
+
+	gpu::Buffer buffer;
+	if (!gpu::createBuffer(capacity * element_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, buffer)) return;
+
+	gpu::destroyBuffer(lights.buffer);
+	lights.buffer = buffer;
+	lights.capacity = capacity;
+	writeBufferDescriptor(scene_descriptor_set, binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, buffer.buffer);
+}
+
+bool reserveObjectBuffer(uint32_t count) {
+	if (object_ubo.buffer != VK_NULL_HANDLE && count <= object_capacity) return true;
+
+	const uint32_t capacity = std::max({ 64u, count, object_capacity * 2 });
+
+	gpu::Buffer buffer;
+	if (!gpu::createBuffer(capacity * object_stride, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, buffer)) return false;
+
+	gpu::destroyBuffer(object_ubo);
+	object_ubo = buffer;
+	object_capacity = capacity;
+	for (GpuMaterial& material : materials) {
+		writeBufferDescriptor(material.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+		                      object_ubo.buffer, sizeof(ObjectData));
+	}
+	return true;
+}
+
+bool createDescriptorSetLayouts() {
 	auto& ctx = graphics::internal::context;
 
-	const VkDescriptorSetLayoutBinding binding = {
-		.binding = 0,
-		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = 1,
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	const VkDescriptorSetLayoutBinding scene_bindings[] = {
+		{ .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1,
+		  .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT },
+		{ .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+		  .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+		{ .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1,
+		  .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
 	};
-	const VkDescriptorSetLayoutCreateInfo layout_info = {
+	const VkDescriptorSetLayoutCreateInfo scene_layout_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = 1,
-		.pBindings = &binding,
+		.bindingCount = uint32_t(std::size(scene_bindings)),
+		.pBindings = scene_bindings,
 	};
-	if (vkCreateDescriptorSetLayout(ctx.device, &layout_info, nullptr, &descriptor_set_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create descriptor set layout\n";
+	if (vkCreateDescriptorSetLayout(ctx.device, &scene_layout_info, nullptr, &scene_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create scene descriptor set layout\n";
 		return false;
 	}
 
-	const VkDescriptorPoolSize pool_size = {
-		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-		.descriptorCount = max_objects,
+	const VkDescriptorSetLayoutBinding material_bindings[] = {
+		{ .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .descriptorCount = 1,
+		  .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT },
+		{ .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
+		  .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+		{ .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
+		  .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+		{ .binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
+		  .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+	};
+	const VkDescriptorSetLayoutCreateInfo material_layout_info = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = uint32_t(std::size(material_bindings)),
+		.pBindings = material_bindings,
+	};
+	if (vkCreateDescriptorSetLayout(ctx.device, &material_layout_info, nullptr, &material_set_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create material descriptor set layout\n";
+		return false;
+	}
+	return true;
+}
+
+bool createDescriptors() {
+	auto& ctx = graphics::internal::context;
+
+	if (!createDescriptorSetLayouts()) return false;
+
+	constexpr uint32_t set_count = 1 + material_count;
+	const VkDescriptorPoolSize pool_sizes[] = {
+		{ .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1 },
+		{ .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 },
+		{ .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .descriptorCount = material_count },
+		{ .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3 * material_count },
 	};
 	const VkDescriptorPoolCreateInfo pool_info = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.maxSets = max_objects,
-		.poolSizeCount = 1,
-		.pPoolSizes = &pool_size,
+		.maxSets = set_count,
+		.poolSizeCount = uint32_t(std::size(pool_sizes)),
+		.pPoolSizes = pool_sizes,
 	};
 	if (vkCreateDescriptorPool(ctx.device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) {
 		std::cerr << "Failed to create descriptor pool\n";
 		return false;
 	}
 
-	VkDescriptorSetLayout layouts[max_objects];
-	std::fill(std::begin(layouts), std::end(layouts), descriptor_set_layout);
+	if (!allocateDescriptorSet(scene_set_layout, scene_descriptor_set)) return false;
+	if (!gpu::createBuffer(sizeof(SceneData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, scene_ubo)) return false;
+	writeBufferDescriptor(scene_descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, scene_ubo.buffer);
 
-	VkDescriptorSet sets[max_objects];
-	const VkDescriptorSetAllocateInfo alloc_info = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-		.descriptorPool = descriptor_pool,
-		.descriptorSetCount = max_objects,
-		.pSetLayouts = layouts,
+	reserveLightBuffer(point_light_buffer, 0, sizeof(GpuPointLight), 1);
+	reserveLightBuffer(spot_light_buffer, 0, sizeof(GpuSpotLight), 2);
+	return point_light_buffer.buffer.buffer != VK_NULL_HANDLE && spot_light_buffer.buffer.buffer != VK_NULL_HANDLE;
+}
+
+VkImageView loadMap(const char* path, VkFormat format, texture::Texture& out, const texture::Texture& fallback) {
+	if (path && texture::loadFromFile(path, format, out)) return out.view;
+	return fallback.view;
+}
+
+bool createMaterials() {
+	const uint8_t black[4] = { 0, 0, 0, 255 };
+	const uint8_t white[4] = { 255, 255, 255, 255 };
+	if (!texture::createFromPixels(black, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, black_texture)) return false;
+	if (!texture::createFromPixels(white, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, white_texture)) return false;
+
+	sampler = texture::createSampler();
+	if (sampler == VK_NULL_HANDLE) return false;
+
+	for (uint32_t i = 0; i < material_count; ++i) {
+		const MaterialFiles& files = material_files[i];
+		GpuMaterial& material = materials[i];
+
+		if (!allocateDescriptorSet(material_set_layout, material.descriptor_set)) return false;
+		writeImageDescriptor(material.descriptor_set, 1,
+		                     loadMap(files.albedo, VK_FORMAT_R8G8B8A8_SRGB, material.albedo, white_texture));
+		writeImageDescriptor(material.descriptor_set, 2,
+		                     loadMap(files.specular, VK_FORMAT_R8G8B8A8_UNORM, material.specular, black_texture));
+		writeImageDescriptor(material.descriptor_set, 3,
+		                     loadMap(files.emissive, VK_FORMAT_R8G8B8A8_SRGB, material.emissive, black_texture));
+	}
+
+	VkPhysicalDeviceProperties properties = {};
+	vkGetPhysicalDeviceProperties(graphics::internal::context.physical_device, &properties);
+	const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
+	object_stride = (sizeof(ObjectData) + alignment - 1) / alignment * alignment;
+
+	return reserveObjectBuffer(0);
+}
+
+void destroyMaterials() {
+	for (GpuMaterial& material : materials) {
+		texture::destroy(material.albedo);
+		texture::destroy(material.specular);
+		texture::destroy(material.emissive);
+	}
+	texture::destroy(black_texture);
+	texture::destroy(white_texture);
+	vkDestroySampler(graphics::internal::context.device, sampler, nullptr);
+}
+
+bool createPipelineLayout() {
+	const VkDescriptorSetLayout set_layouts[] = { scene_set_layout, material_set_layout };
+	const VkPushConstantRange push_range = {
+		.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		.offset = 0,
+		.size = sizeof(SamplingPushConstants),
 	};
-	if (vkAllocateDescriptorSets(ctx.device, &alloc_info, sets) != VK_SUCCESS) {
-		std::cerr << "Failed to allocate descriptor sets\n";
+	const VkPipelineLayoutCreateInfo layout_info = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = uint32_t(std::size(set_layouts)),
+		.pSetLayouts = set_layouts,
+		.pushConstantRangeCount = 1,
+		.pPushConstantRanges = &push_range,
+	};
+	if (vkCreatePipelineLayout(graphics::internal::context.device, &layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
+		std::cerr << "Failed to create pipeline layout\n";
 		return false;
 	}
-
-	for (uint32_t i = 0; i < max_objects; ++i) {
-		if (!gpu::createBuffer(sizeof(UniformData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, slots[i].ubo)) {
-			return false;
-		}
-		slots[i].descriptor_set = sets[i];
-
-		const VkDescriptorBufferInfo buffer_info = {
-			.buffer = slots[i].ubo.buffer,
-			.offset = 0,
-			.range = sizeof(UniformData),
-		};
-		const VkWriteDescriptorSet write = {
-			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstSet = sets[i],
-			.dstBinding = 0,
-			.dstArrayElement = 0,
-			.descriptorCount = 1,
-			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.pBufferInfo = &buffer_info,
-		};
-		vkUpdateDescriptorSets(ctx.device, 1, &write, 0, nullptr);
-	}
-
-	free_slots.clear();
-	for (uint32_t i = max_objects; i > 0; --i) free_slots.push_back(i - 1);
 	return true;
 }
 
-bool createPipeline() {
+struct PipelineDesc {
+	const char* vertex_shader;
+	const char* fragment_shader;
+	VkPrimitiveTopology topology;
+	uint32_t vertex_attribute_count;
+	VkCullModeFlags cull_mode;
+	bool depth_write;
+};
+
+VkPipeline createPipeline(const PipelineDesc& desc) {
 	auto& ctx = graphics::internal::context;
 
-	VkShaderModule vert = createShaderModule("shaders/cone.vert.spv");
-	VkShaderModule frag = createShaderModule("shaders/cone.frag.spv");
+	VkShaderModule vert = createShaderModule(desc.vertex_shader);
+	VkShaderModule frag = createShaderModule(desc.fragment_shader);
 	if (!vert || !frag) {
 		if (vert) vkDestroyShaderModule(ctx.device, vert, nullptr);
 		if (frag) vkDestroyShaderModule(ctx.device, frag, nullptr);
-		return false;
+		return VK_NULL_HANDLE;
 	}
 
 	const VkPipelineShaderStageCreateInfo stages[2] = {
@@ -339,31 +782,32 @@ bool createPipeline() {
 
 	const VkVertexInputBindingDescription vertex_binding = {
 		.binding = 0,
-		.stride = sizeof(cone::Vertex),
+		.stride = sizeof(mesh::Vertex),
 		.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
 	};
-	
-	const VkVertexInputAttributeDescription vertex_attributes[2] = {
+
+	const VkVertexInputAttributeDescription vertex_attributes[3] = {
 		{ .location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT,
-		  .offset = offsetof(cone::Vertex, position) },
+		  .offset = offsetof(mesh::Vertex, position) },
 		{ .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT,
-		  .offset = offsetof(cone::Vertex, color) },
+		  .offset = offsetof(mesh::Vertex, normal) },
+		{ .location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT,
+		  .offset = offsetof(mesh::Vertex, uv) },
 	};
 	const VkPipelineVertexInputStateCreateInfo vertex_input = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
 		.vertexBindingDescriptionCount = 1,
 		.pVertexBindingDescriptions = &vertex_binding,
-		.vertexAttributeDescriptionCount = 2,
+		.vertexAttributeDescriptionCount = desc.vertex_attribute_count,
 		.pVertexAttributeDescriptions = vertex_attributes,
 	};
 
 	const VkPipelineInputAssemblyStateCreateInfo input_assembly = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		.topology = desc.topology,
 		.primitiveRestartEnable = VK_FALSE,
 	};
 
-	// количество viewport/scissor.
 	const VkPipelineViewportStateCreateInfo viewport = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
 		.viewportCount = 1,
@@ -372,27 +816,24 @@ bool createPipeline() {
 
 	const VkPipelineRasterizationStateCreateInfo rasterization = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-		.polygonMode = VK_POLYGON_MODE_FILL,      // LINE — каркасом (пригодится для отладки!)
-		.cullMode = VK_CULL_MODE_BACK_BIT,
+		.polygonMode = VK_POLYGON_MODE_FILL,
+		.cullMode = desc.cull_mode,
 		.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
 		.lineWidth = 1.0f,
 	};
 
-	// MSAA выключен: 1 сэмпл на пиксель.
 	const VkPipelineMultisampleStateCreateInfo multisample = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
 		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
 	};
 
-	// Тест глубины
 	const VkPipelineDepthStencilStateCreateInfo depth = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
 		.depthTestEnable = VK_TRUE,
-		.depthWriteEnable = VK_TRUE,
+		.depthWriteEnable = desc.depth_write ? VK_TRUE : VK_FALSE,
 		.depthCompareOp = VK_COMPARE_OP_LESS,
 	};
 
-	// Смешивание выключено, 4 канала цвета.
 	const VkPipelineColorBlendAttachmentState blend_attachment = {
 		.blendEnable = VK_FALSE,
 		.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -411,18 +852,6 @@ bool createPipeline() {
 		.pDynamicStates = dynamic_states,
 	};
 
-	const VkPipelineLayoutCreateInfo layout_info = {
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-		.setLayoutCount = 1,
-		.pSetLayouts = &descriptor_set_layout,
-	};
-	if (vkCreatePipelineLayout(ctx.device, &layout_info, nullptr, &pipeline_layout) != VK_SUCCESS) {
-		std::cerr << "Failed to create pipeline layout\n";
-		vkDestroyShaderModule(ctx.device, vert, nullptr);
-		vkDestroyShaderModule(ctx.device, frag, nullptr);
-		return false;
-	}
-
 	const VkGraphicsPipelineCreateInfo info = {
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
 		.stageCount = 2,
@@ -440,19 +869,222 @@ bool createPipeline() {
 		.subpass = 0,
 	};
 
+	VkPipeline pipeline = VK_NULL_HANDLE;
 	const VkResult result = vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
-	// Шейдерные модули на время создания pipeline
 	vkDestroyShaderModule(ctx.device, vert, nullptr);
 	vkDestroyShaderModule(ctx.device, frag, nullptr);
 
 	if (result != VK_SUCCESS) {
-		std::cerr << "Failed to create graphics pipeline\n";
-		return false;
+		std::cerr << "Failed to create graphics pipeline (" << desc.vertex_shader << ")\n";
+		return VK_NULL_HANDLE;
 	}
+	return pipeline;
+}
+
+bool createPipelines() {
+	if (!createPipelineLayout()) return false;
+
+	lit_pipeline = createPipeline({
+		.vertex_shader = "shaders/lighting.vert.spv",
+		.fragment_shader = "shaders/lighting.frag.spv",
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		.vertex_attribute_count = 3,
+		.cull_mode = VK_CULL_MODE_BACK_BIT,
+		.depth_write = true,
+	});
+	marker_pipeline = createPipeline({
+		.vertex_shader = "shaders/marker.vert.spv",
+		.fragment_shader = "shaders/marker.frag.spv",
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		.vertex_attribute_count = 1,
+		.cull_mode = VK_CULL_MODE_BACK_BIT,
+		.depth_write = true,
+	});
+	line_pipeline = createPipeline({
+		.vertex_shader = "shaders/marker.vert.spv",
+		.fragment_shader = "shaders/marker.frag.spv",
+		.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+		.vertex_attribute_count = 1,
+		.cull_mode = VK_CULL_MODE_NONE,
+		.depth_write = false,
+	});
+	return lit_pipeline && marker_pipeline && line_pipeline;
+}
+
+
+bool createMesh(GpuMesh& gpu_mesh, size_t max_vertices, size_t max_indices) {
+	return gpu::createDeviceLocalBuffer(sizeof(mesh::Vertex) * max_vertices, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, gpu_mesh.vertices) &&
+	       gpu::createDeviceLocalBuffer(sizeof(uint16_t) * max_indices, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, gpu_mesh.indices);
+}
+
+void uploadMesh(GpuMesh& gpu_mesh, const std::vector<mesh::Vertex>& vertices, const std::vector<uint16_t>& indices) {
+	gpu::uploadToDevice(gpu_mesh.vertices, vertices.data(), vertices.size() * sizeof(mesh::Vertex));
+	gpu::uploadToDevice(gpu_mesh.indices, indices.data(), indices.size() * sizeof(uint16_t));
+	gpu_mesh.index_count = uint32_t(indices.size());
+}
+
+using BuildFunction = void (*)(std::vector<mesh::Vertex>&, std::vector<uint16_t>&);
+
+bool createStaticMesh(GpuMesh& gpu_mesh, BuildFunction build) {
+	std::vector<mesh::Vertex> vertices;
+	std::vector<uint16_t> indices;
+	build(vertices, indices);
+	if (!createMesh(gpu_mesh, vertices.size(), indices.size())) return false;
+	uploadMesh(gpu_mesh, vertices, indices);
 	return true;
 }
 
+bool createMeshes() {
+	return createMesh(cone_mesh, cone::max_vertices, cone::max_indices) &&
+	       createStaticMesh(plane_mesh, mesh::buildPlane) &&
+	       createStaticMesh(cube_mesh, mesh::buildCube) &&
+	       createStaticMesh(spot_wire_mesh, mesh::buildSpotWireframe);
+}
+
+void destroyMesh(GpuMesh& gpu_mesh) {
+	gpu::destroyBuffer(gpu_mesh.vertices);
+	gpu::destroyBuffer(gpu_mesh.indices);
+	gpu_mesh.index_count = 0;
+}
+
+void bindMesh(VkCommandBuffer cmd, const GpuMesh& gpu_mesh) {
+	const VkDeviceSize vertex_offset = 0;
+	vkCmdBindVertexBuffers(cmd, 0, 1, &gpu_mesh.vertices.buffer, &vertex_offset);
+	vkCmdBindIndexBuffer(cmd, gpu_mesh.indices.buffer, 0, VK_INDEX_TYPE_UINT16);
+}
+
+
+void updateCamera(float dt) {
+	const ImGuiIO& io = ImGui::GetIO();
+
+	const bool right_button = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+	if (right_button && !mouse_look && !io.WantCaptureMouse) {
+		mouse_look = true;
+		glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+		glfwGetCursorPos(window, &last_cursor_x, &last_cursor_y);
+	} else if (!right_button && mouse_look) {
+		mouse_look = false;
+		glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+	}
+
+	if (mouse_look) {
+		double x = 0.0, y = 0.0;
+		glfwGetCursorPos(window, &x, &y);
+		camera.yaw_deg = std::remainder(camera.yaw_deg + float(x - last_cursor_x) * camera.mouse_sensitivity, 360.0f);
+		camera.pitch_deg = std::clamp(camera.pitch_deg - float(y - last_cursor_y) * camera.mouse_sensitivity, -89.0f, 89.0f);
+		last_cursor_x = x;
+		last_cursor_y = y;
+	}
+
+	if (io.WantCaptureKeyboard) return;
+
+	auto axis = [](int positive_key, int negative_key) {
+		return float(glfwGetKey(window, positive_key) == GLFW_PRESS) -
+		       float(glfwGetKey(window, negative_key) == GLFW_PRESS);
+	};
+
+	const vec3 forward = cameraForward();
+	const vec3 right = normalize(cross(forward, world_up));
+	const vec3 move = forward * axis(GLFW_KEY_W, GLFW_KEY_S) +
+	                  right * axis(GLFW_KEY_D, GLFW_KEY_A) +
+	                  world_up * axis(GLFW_KEY_E, GLFW_KEY_Q);
+	if (length(move) < 1e-6f) return;
+
+	const bool fast = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
+	const float speed = camera.move_speed * (fast ? 3.0f : 1.0f);
+	camera.position = camera.position + normalize(move) * (speed * dt);
+}
+
+void advanceAnimation(Animation& anim, float dt) {
+	if (anim.enabled && anim.playing) {
+		anim.time += dt * anim.speed;
+	}
+}
+
+const char* materialName(void*, int index) {
+	return material_files[index].name;
+}
+
+
+template <typename T>
+void drawSelectableList(const std::vector<T>& items, int& selected) {
+	if (ImGui::BeginListBox("##list", ImVec2(-FLT_MIN, 4 * ImGui::GetTextLineHeightWithSpacing()))) {
+		for (int i = 0; i < int(items.size()); ++i) {
+			ImGui::PushID(i);
+			if (ImGui::Selectable(items[i].name, selected == i)) selected = i;
+			ImGui::PopID();
+		}
+		ImGui::EndListBox();
+	}
+}
+
+void drawMaterialUi(Material& material) {
+	ImGui::Combo("Текстура", &material.texture, materialName, nullptr, int(material_count));
+	const MaterialFiles& files = material_files[material.texture];
+	ImGui::TextDisabled("specular: %s", files.specular ? files.specular : "нет (чёрный пиксель)");
+	ImGui::TextDisabled("emissive: %s", files.emissive ? files.emissive : "нет (чёрный пиксель)");
+
+	ImGui::ColorEdit3("Оттенок альбедо", &material.albedo.x);
+	ImGui::SetItemTooltip("Умножается на цвет из текстуры; белый — текстура как есть");
+	ImGui::ColorEdit3("Цвет блика", &material.specular.x);
+	ImGui::SliderFloat("Shininess", &material.shininess, 1.0f, 512.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
+	ImGui::SliderFloat("Яркость свечения", &material.emission, 0.0f, 5.0f, "%.2f");
+}
+
+void drawAnimationUi(Animation& anim, bool allow_orientation) {
+	ImGui::Checkbox("Движение по траектории", &anim.enabled);
+
+	ImGui::BeginDisabled(!anim.enabled);
+	if (ImGui::Button(anim.playing ? "Пауза" : "Play")) anim.playing = !anim.playing;
+	ImGui::SameLine();
+	if (ImGui::Button("В начало")) anim.time = 0.0f;
+
+	ImGui::SliderFloat("Скорость", &anim.speed, -5.0f, 5.0f, "%.2f");
+
+	int type = int(anim.path.type);
+	if (ImGui::Combo("Траектория", &type, trajectory::type_names, IM_ARRAYSIZE(trajectory::type_names))) {
+		anim.path.type = trajectory::Type(type);
+	}
+	ImGui::DragFloat("Радиус траектории", &anim.path.radius, 0.01f, 0.0f, 20.0f, "%.2f");
+
+	switch (anim.path.type) {
+	case trajectory::Type::Lissajous:
+		ImGui::DragFloat("Частота X", &anim.path.freq_a, 0.01f, 0.0f, 10.0f, "%.2f");
+		ImGui::DragFloat("Частота Y", &anim.path.freq_b, 0.01f, 0.0f, 10.0f, "%.2f");
+		ImGui::DragFloat("Частота Z", &anim.path.freq_c, 0.01f, 0.0f, 10.0f, "%.2f");
+		ImGui::DragFloat("Фаза X", &anim.path.phase, 0.01f, -PI, PI, "%.2f");
+		break;
+	case trajectory::Type::Trefoil:
+	case trajectory::Type::Circle:
+		ImGui::DragFloat("Частота обхода", &anim.path.freq_a, 0.01f, 0.0f, 10.0f, "%.2f");
+		break;
+	case trajectory::Type::Spiral:
+		ImGui::DragFloat("Частота вращения", &anim.path.freq_a, 0.01f, 0.0f, 10.0f, "%.2f");
+		ImGui::DragFloat("Частота подъёма", &anim.path.freq_b, 0.01f, 0.0f, 10.0f, "%.2f");
+		break;
+	}
+
+	if (allow_orientation) {
+		ImGui::Checkbox("Поворачивать по направлению движения", &anim.orient_along_path);
+	}
+	ImGui::EndDisabled();
+}
+
+void drawCameraUi() {
+	if (!ImGui::CollapsingHeader("Камера", ImGuiTreeNodeFlags_DefaultOpen)) return;
+	ImGui::PushID("camera");
+
+	ImGui::TextDisabled("WASD — движение, Q/E — вниз/вверх, Shift — быстрее, ПКМ — обзор");
+	ImGui::DragFloat3("Позиция", &camera.position.x, 0.05f);
+	ImGui::SliderFloat("Yaw (°)", &camera.yaw_deg, -180.0f, 180.0f, "%.1f");
+	ImGui::SliderFloat("Pitch (°)", &camera.pitch_deg, -89.0f, 89.0f, "%.1f");
+	ImGui::DragFloat("Скорость (ед/с)", &camera.move_speed, 0.05f, 0.1f, 50.0f, "%.2f");
+	ImGui::DragFloat("Чувствительность мыши", &camera.mouse_sensitivity, 0.005f, 0.01f, 1.0f, "%.3f");
+	if (ImGui::Button("Сбросить камеру")) camera = {};
+
+	ImGui::PopID();
+}
 
 void drawProjectionUi() {
 	if (!ImGui::CollapsingHeader("Проекция", ImGuiTreeNodeFlags_DefaultOpen)) return;
@@ -471,21 +1103,99 @@ void drawProjectionUi() {
 	}
 	ImGui::DragFloat("Near", &projection.near_plane, 0.01f, 0.01f, 10.0f, "%.2f");
 	ImGui::DragFloat("Far", &projection.far_plane, 0.5f, 0.1f, 1000.0f, "%.1f");
-	// far обязан дальше near
 	projection.far_plane = std::max(projection.far_plane, projection.near_plane + 0.01f);
 }
 
-void drawCameraUi() {
-	if (!ImGui::CollapsingHeader("Камера")) return;
+void drawAmbientUi() {
+	if (!ImGui::CollapsingHeader("Фоновое освещение (ambient)")) return;
+	ImGui::PushID("ambient");
 
-	ImGui::SliderFloat("Азимут (°)", &camera.yaw_deg, -180.0f, 180.0f, "%.0f");
-	ImGui::SliderFloat("Наклон (°)", &camera.pitch_deg, -89.0f, 89.0f, "%.0f");
-	ImGui::DragFloat("Дистанция", &camera.distance, 0.05f, 0.2f, 100.0f, "%.2f");
-	ImGui::DragFloat3("Цель", &camera.target.x, 0.01f);
-	if (!projection.perspective) {
-		ImGui::TextDisabled("В ортографии дистанция не меняет размер — меняйте размер коробки.");
+	ImGui::ColorEdit3("Цвет", &ambient.color.x);
+	ImGui::SliderFloat("Интенсивность", &ambient.intensity, 0.0f, 1.0f, "%.3f");
+
+	ImGui::PopID();
+}
+
+void drawDirectionalLightUi() {
+	if (!ImGui::CollapsingHeader("Направленный свет")) return;
+	ImGui::PushID("directional");
+
+	ImGui::Checkbox("Включён", &sun.enabled);
+	ImGui::BeginDisabled(!sun.enabled);
+	ImGui::DragFloat3("Направление", &sun.direction.x, 0.01f, -1.0f, 1.0f, "%.2f");
+	ImGui::SetItemTooltip("Куда светит; нормализуется перед отправкой в шейдер");
+	ImGui::ColorEdit3("Цвет", &sun.color.x);
+	ImGui::DragFloat("Интенсивность", &sun.intensity, 0.01f, 0.0f, 20.0f, "%.2f");
+	ImGui::EndDisabled();
+
+	ImGui::PopID();
+}
+
+void drawPointLightsUi() {
+	if (!ImGui::CollapsingHeader("Точечные источники")) return;
+	ImGui::PushID("point_lights");
+
+	ImGui::Text("Источников: %d, ёмкость буфера: %u", int(point_lights.size()), point_light_buffer.capacity);
+	drawSelectableList(point_lights, selected_point_light);
+
+	if (ImGui::Button("Добавить")) addPointLight();
+	ImGui::SameLine();
+	ImGui::BeginDisabled(selected_point_light < 0);
+	if (ImGui::Button("Удалить")) removeSelected(point_lights, selected_point_light);
+	ImGui::EndDisabled();
+
+	if (selected_point_light >= 0) {
+		PointLight& light = point_lights[selected_point_light];
+		ImGui::SeparatorText(light.name);
+		ImGui::DragFloat3("Позиция", &light.position.x, 0.01f);
+		ImGui::ColorEdit3("Цвет", &light.color.x);
+		ImGui::DragFloat("Интенсивность", &light.intensity, 0.05f, 0.0f, 1000.0f, "%.2f");
+		ImGui::SetItemTooltip("Освещённость на расстоянии d: интенсивность / d²");
+		drawAnimationUi(light.anim, false);
 	}
-	if (ImGui::Button("Сбросить камеру")) camera = {};
+
+	ImGui::PopID();
+}
+
+void drawSpotLightsUi() {
+	if (!ImGui::CollapsingHeader("Прожекторы")) return;
+	ImGui::PushID("spot_lights");
+
+	ImGui::Text("Прожекторов: %d, ёмкость буфера: %u", int(spot_lights.size()), spot_light_buffer.capacity);
+	drawSelectableList(spot_lights, selected_spot_light);
+
+	if (ImGui::Button("Добавить")) addSpotLight();
+	ImGui::SameLine();
+	ImGui::BeginDisabled(selected_spot_light < 0);
+	if (ImGui::Button("Удалить")) removeSelected(spot_lights, selected_spot_light);
+	ImGui::EndDisabled();
+
+	if (selected_spot_light >= 0) {
+		SpotLight& light = spot_lights[selected_spot_light];
+		ImGui::SeparatorText(light.name);
+		ImGui::DragFloat3("Позиция", &light.position.x, 0.01f);
+		ImGui::DragFloat3("Направление", &light.direction.x, 0.01f, -10.0f, 10.0f, "%.2f");
+		ImGui::ColorEdit3("Цвет", &light.color.x);
+		ImGui::DragFloat("Интенсивность", &light.intensity, 0.05f, 0.0f, 1000.0f, "%.2f");
+		ImGui::SliderFloat("Внутренний угол (°)", &light.inner_deg, 0.0f, 85.0f, "%.1f");
+		ImGui::SliderFloat("Внешний угол (°)", &light.outer_deg, 0.0f, 85.0f, "%.1f");
+		if (light.outer_deg <= light.inner_deg) {
+			ImGui::TextDisabled("Внешний угол <= внутреннего: край жёсткий");
+		}
+		drawAnimationUi(light.anim, false);
+	}
+
+	ImGui::PopID();
+}
+
+void drawLightVisualizationUi() {
+	if (!ImGui::CollapsingHeader("Визуализация источников")) return;
+
+	ImGui::Checkbox("Показывать источники", &light_viz.enabled);
+	ImGui::BeginDisabled(!light_viz.enabled);
+	ImGui::DragFloat("Размер маркера", &light_viz.marker_size, 0.005f, 0.01f, 1.0f, "%.3f");
+	ImGui::DragFloat("Длина каркаса прожектора", &light_viz.spot_length, 0.01f, 0.1f, 20.0f, "%.2f");
+	ImGui::EndDisabled();
 }
 
 void drawConeUi() {
@@ -498,28 +1208,57 @@ void drawConeUi() {
 	if (changed) cone_dirty = true;
 }
 
+void drawSurfaceUi(const char* id, Surface& surface) {
+	ImGui::PushID(id);
+	ImGui::Checkbox("Показывать", &surface.visible);
+	ImGui::DragFloat("Размер плитки текстуры (м)", &surface.tile_size, 0.01f, 0.1f, 50.0f, "%.2f");
+	drawMaterialUi(surface.material);
+	ImGui::PopID();
+}
+
+void drawRoomUi() {
+	if (!ImGui::CollapsingHeader("Комната (пол и стены)")) return;
+	ImGui::PushID("room");
+
+	ImGui::DragFloat("Размер", &room.size, 0.1f, 0.5f, 200.0f, "%.1f");
+	ImGui::DragFloat("Высота пола", &room.floor_height, 0.01f, -20.0f, 20.0f, "%.2f");
+	ImGui::DragFloat("Высота стен", &room.wall_height, 0.01f, 0.1f, 50.0f, "%.2f");
+	ImGui::SeparatorText("Пол");
+	drawSurfaceUi("floor", room.floor);
+	ImGui::SeparatorText("Стены");
+	drawSurfaceUi("walls", room.walls);
+
+	ImGui::PopID();
+}
+
+void drawSamplingEffectUi() {
+	if (!ImGui::CollapsingHeader("Нетривиальное сэмплирование")) return;
+	ImGui::PushID("sampling");
+
+	ImGui::TextDisabled("Включается у объекта флажком; параметры идут в push constants");
+	if (ImGui::Button(sampling_effect.playing ? "Пауза" : "Play")) sampling_effect.playing = !sampling_effect.playing;
+	ImGui::SliderFloat("Скорость", &sampling_effect.speed, 0.0f, 5.0f, "%.2f");
+	ImGui::SliderFloat("Искажение UV", &sampling_effect.distortion, 0.0f, 0.1f, "%.3f");
+	ImGui::SliderFloat("Доля второго слоя", &sampling_effect.layer_mix, 0.0f, 1.0f, "%.2f");
+
+	ImGui::PopID();
+}
+
 void drawObjectListUi() {
 	if (!ImGui::CollapsingHeader("Объекты", ImGuiTreeNodeFlags_DefaultOpen)) return;
+	ImGui::PushID("objects");
 
-	ImGui::Text("Объектов: %d / %u", int(objects.size()), max_objects);
+	ImGui::Text("Объектов: %d, ёмкость динамического UBO: %u", int(objects.size()), object_capacity);
+	drawSelectableList(objects, selected_object);
 
-	if (ImGui::BeginListBox("##objects", ImVec2(-FLT_MIN, 5 * ImGui::GetTextLineHeightWithSpacing()))) {
-		for (int i = 0; i < int(objects.size()); ++i) {
-			ImGui::PushID(i);
-			if (ImGui::Selectable(objects[i].name, selected == i)) selected = i;
-			ImGui::PopID();
-		}
-		ImGui::EndListBox();
-	}
-
-	ImGui::BeginDisabled(free_slots.empty());
 	if (ImGui::Button("Добавить")) addObject();
-	ImGui::EndDisabled();
 
 	ImGui::SameLine();
-	ImGui::BeginDisabled(selected < 0);
-	if (ImGui::Button("Удалить")) removeObject(selected);
+	ImGui::BeginDisabled(selected_object < 0);
+	if (ImGui::Button("Удалить")) removeObject(selected_object);
 	ImGui::EndDisabled();
+
+	ImGui::PopID();
 }
 
 void drawSelectedObjectUi(SceneObject& obj) {
@@ -537,76 +1276,145 @@ void drawSelectedObjectUi(SceneObject& obj) {
 		}
 	}
 
-	if (ImGui::CollapsingHeader("Цвет", ImGuiTreeNodeFlags_DefaultOpen)) {
-		ImGui::ColorEdit3("Цвет", &obj.color.x);
-		ImGui::Checkbox("Процедурные цвета вершин", &obj.procedural_colors);
-		ImGui::SetItemTooltip("Итоговый цвет = цвет вершины * выбранный цвет");
+	if (ImGui::CollapsingHeader("Материал", ImGuiTreeNodeFlags_DefaultOpen)) {
+		drawMaterialUi(obj.material);
+		ImGui::Checkbox("Нетривиальное сэмплирование", &obj.special_sampling);
 	}
 
 	if (ImGui::CollapsingHeader("Анимация", ImGuiTreeNodeFlags_DefaultOpen)) {
-		Animation& anim = obj.anim;
-		ImGui::Checkbox("Движение по траектории", &anim.enabled);
-
-		ImGui::BeginDisabled(!anim.enabled);
-		if (ImGui::Button(anim.playing ? "Пауза" : "Play")) anim.playing = !anim.playing;
-		ImGui::SameLine();
-		if (ImGui::Button("В начало")) anim.time = 0.0f;
-
-		ImGui::SliderFloat("Скорость", &anim.speed, -5.0f, 5.0f, "%.2f");
-
-		int type = int(anim.path.type);
-		if (ImGui::Combo("Траектория", &type, trajectory::type_names, IM_ARRAYSIZE(trajectory::type_names))) {
-			anim.path.type = trajectory::Type(type);
-		}
-		ImGui::DragFloat("Радиус траектории", &anim.path.radius, 0.01f, 0.0f, 20.0f, "%.2f");
-
-		switch (anim.path.type) {
-		case trajectory::Type::Lissajous:
-			ImGui::DragFloat("Частота X", &anim.path.freq_a, 0.01f, 0.0f, 10.0f, "%.2f");
-			ImGui::DragFloat("Частота Y", &anim.path.freq_b, 0.01f, 0.0f, 10.0f, "%.2f");
-			ImGui::DragFloat("Частота Z", &anim.path.freq_c, 0.01f, 0.0f, 10.0f, "%.2f");
-			ImGui::DragFloat("Фаза X", &anim.path.phase, 0.01f, -PI, PI, "%.2f");
-			break;
-		case trajectory::Type::Trefoil:
-			ImGui::DragFloat("Частота обхода", &anim.path.freq_a, 0.01f, 0.0f, 10.0f, "%.2f");
-			break;
-		case trajectory::Type::Spiral:
-			ImGui::DragFloat("Частота вращения", &anim.path.freq_a, 0.01f, 0.0f, 10.0f, "%.2f");
-			ImGui::DragFloat("Частота подъёма", &anim.path.freq_b, 0.01f, 0.0f, 10.0f, "%.2f");
-			break;
-		}
-
-		ImGui::Checkbox("Поворачивать по направлению движения", &anim.orient_along_path);
-		ImGui::EndDisabled();
+		drawAnimationUi(obj.anim, true);
 	}
 }
 
 void drawUi() {
+	const ImGuiIO& io = ImGui::GetIO();
+
 	ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_FirstUseEver);
-	ImGui::SetNextWindowSize(ImVec2(420.0f, 680.0f), ImGuiCond_FirstUseEver);
-	if (ImGui::Begin("Лабораторная №1 — Конус")) {
-		ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
-		drawProjectionUi();
+	ImGui::SetNextWindowSize(ImVec2(390.0f, 600.0f), ImGuiCond_FirstUseEver);
+	if (ImGui::Begin("Лабораторная №3 — Текстурирование")) {
+		ImGui::Text("%.1f FPS", io.Framerate);
 		drawCameraUi();
+		drawProjectionUi();
+		drawAmbientUi();
+		drawDirectionalLightUi();
+		drawPointLightsUi();
+		drawSpotLightsUi();
+		drawLightVisualizationUi();
+		drawSamplingEffectUi();
+	}
+	ImGui::End();
+
+	ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 400.0f, 10.0f), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(ImVec2(390.0f, 600.0f), ImGuiCond_FirstUseEver);
+	if (ImGui::Begin("Объекты")) {
 		drawConeUi();
+		drawRoomUi();
 		drawObjectListUi();
-		if (selected >= 0 && selected < int(objects.size())) {
-			drawSelectedObjectUi(objects[selected]);
+		if (selected_object >= 0 && selected_object < int(objects.size())) {
+			drawSelectedObjectUi(objects[selected_object]);
 		}
 	}
 	ImGui::End();
 }
 
+
+uint32_t uploadPointLights() {
+	reserveLightBuffer(point_light_buffer, uint32_t(point_lights.size()), sizeof(GpuPointLight), 1);
+	const uint32_t count = std::min(uint32_t(point_lights.size()), point_light_buffer.capacity);
+
+	std::vector<GpuPointLight> data(count);
+	for (uint32_t i = 0; i < count; ++i) {
+		const PointLight& light = point_lights[i];
+		data[i] = {
+			.position = toVec4(lightPosition(light), 1.0f),
+			.color = toVec4(srgbToLinear(light.color), light.intensity),
+		};
+	}
+	if (count > 0) gpu::upload(point_light_buffer.buffer, data.data(), count * sizeof(GpuPointLight));
+	return count;
 }
 
-bool initialize() {
+uint32_t uploadSpotLights() {
+	reserveLightBuffer(spot_light_buffer, uint32_t(spot_lights.size()), sizeof(GpuSpotLight), 2);
+	const uint32_t count = std::min(uint32_t(spot_lights.size()), spot_light_buffer.capacity);
+
+	std::vector<GpuSpotLight> data(count);
+	for (uint32_t i = 0; i < count; ++i) {
+		const SpotLight& light = spot_lights[i];
+		data[i] = {
+			.position = toVec4(lightPosition(light), 1.0f),
+			.direction = toVec4(safeDirection(light.direction), 0.0f),
+			.color = toVec4(srgbToLinear(light.color), light.intensity),
+			.cos_inner = std::cos(radians(light.inner_deg)),
+			.cos_outer = std::cos(radians(light.outer_deg)),
+		};
+	}
+	if (count > 0) gpu::upload(spot_light_buffer.buffer, data.data(), count * sizeof(GpuSpotLight));
+	return count;
+}
+
+void bindObject(VkCommandBuffer cmd, const ObjectData& data, int material) {
+	const uint32_t offset = uint32_t(next_object_index++ * object_stride);
+	gpu::upload(object_ubo, &data, sizeof(data), offset);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+	                        1, 1, &materials[material].descriptor_set, 1, &offset);
+}
+
+void pushSampling(VkCommandBuffer cmd, bool enabled, uint32_t seed) {
+    const SamplingPushConstants constants = {
+        .enabled = enabled ? 1u : 0u,
+        .time = sampling_effect.time,
+        .distortion = sampling_effect.distortion,
+        .layer_mix = sampling_effect.layer_mix,
+        .seed = seed,
+    };
+    vkCmdPushConstants(cmd, pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof(constants), &constants);
+}
+
+void drawLightMarkers(VkCommandBuffer cmd) {
+	const vec3 marker_scale = { light_viz.marker_size, light_viz.marker_size, light_viz.marker_size };
+
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, marker_pipeline);
+	bindMesh(cmd, cube_mesh);
+	for (const PointLight& light : point_lights) {
+		bindObject(cmd, makeMarkerData(translate(lightPosition(light)) * scale(marker_scale), srgbToLinear(light.color)), 0);
+		vkCmdDrawIndexed(cmd, cube_mesh.index_count, 1, 0, 0, 0);
+	}
+	for (const SpotLight& light : spot_lights) {
+		bindObject(cmd, makeMarkerData(translate(lightPosition(light)) * scale(marker_scale), srgbToLinear(light.color)), 0);
+		vkCmdDrawIndexed(cmd, cube_mesh.index_count, 1, 0, 0, 0);
+	}
+
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, line_pipeline);
+	bindMesh(cmd, spot_wire_mesh);
+	for (const SpotLight& light : spot_lights) {
+		bindObject(cmd, makeMarkerData(spotWireModelMatrix(light, light.outer_deg), { 1.0f, 1.0f, 1.0f }), 0);
+		vkCmdDrawIndexed(cmd, spot_wire_mesh.index_count, 1, 0, 0, 0);
+		bindObject(cmd, makeMarkerData(spotWireModelMatrix(light, light.inner_deg), { 1.0f, 1.0f, 0.0f }), 0);
+		vkCmdDrawIndexed(cmd, spot_wire_mesh.index_count, 1, 0, 0, 0);
+	}
+}
+
+uint32_t countDraws() {
+	uint32_t count = 1 + wall_count + uint32_t(objects.size());
+	if (light_viz.enabled) {
+		count += uint32_t(point_lights.size() + 3 * spot_lights.size());
+	}
+	return count;
+}
+
+}
+
+bool initialize(GLFWwindow* app_window) {
+	window = app_window;
 	loadUiFont();
 
+	if (!gpu::initialize()) return false;
 	if (!createDescriptors()) return false;
-	if (!createPipeline()) return false;
-
-	if (!gpu::createBuffer(sizeof(cone::Vertex) * cone::max_vertices, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer)) return false;
-	if (!gpu::createBuffer(sizeof(uint16_t) * cone::max_indices, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer)) return false;
+	if (!createMaterials()) return false;
+	if (!createPipelines()) return false;
+	if (!createMeshes()) return false;
 
 	createDefaultScene();
 	return true;
@@ -616,18 +1424,27 @@ void shutdown() {
 	auto& ctx = graphics::internal::context;
 	vkDeviceWaitIdle(ctx.device);
 
-	vkDestroyPipeline(ctx.device, pipeline, nullptr);
+	vkDestroyPipeline(ctx.device, lit_pipeline, nullptr);
+	vkDestroyPipeline(ctx.device, marker_pipeline, nullptr);
+	vkDestroyPipeline(ctx.device, line_pipeline, nullptr);
 	vkDestroyPipelineLayout(ctx.device, pipeline_layout, nullptr);
 
 	vkDestroyDescriptorPool(ctx.device, descriptor_pool, nullptr);
-	vkDestroyDescriptorSetLayout(ctx.device, descriptor_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(ctx.device, scene_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(ctx.device, material_set_layout, nullptr);
 
-	for (ObjectSlot& slot : slots) {
-		gpu::destroyBuffer(slot.ubo);
-		slot.descriptor_set = VK_NULL_HANDLE;
-	}
-	gpu::destroyBuffer(vertex_buffer);
-	gpu::destroyBuffer(index_buffer);
+	destroyMaterials();
+	gpu::destroyBuffer(object_ubo);
+	gpu::destroyBuffer(scene_ubo);
+	gpu::destroyBuffer(point_light_buffer.buffer);
+	gpu::destroyBuffer(spot_light_buffer.buffer);
+
+	destroyMesh(cone_mesh);
+	destroyMesh(plane_mesh);
+	destroyMesh(cube_mesh);
+	destroyMesh(spot_wire_mesh);
+
+	gpu::shutdown();
 }
 
 
@@ -637,11 +1454,12 @@ void update(double time) {
 	last_time = time;
 	dt = std::min(dt, 0.1f);
 
-	for (SceneObject& obj : objects) {
-		if (obj.anim.enabled && obj.anim.playing) {
-			obj.anim.time += dt * obj.anim.speed;
-		}
-	}
+	updateCamera(dt);
+
+	for (SceneObject& obj : objects) advanceAnimation(obj.anim, dt);
+	for (PointLight& light : point_lights) advanceAnimation(light.anim, dt);
+	for (SpotLight& light : spot_lights) advanceAnimation(light.anim, dt);
+	if (sampling_effect.playing) sampling_effect.time += dt * sampling_effect.speed;
 
 	drawUi();
 }
@@ -652,31 +1470,31 @@ void render(const graphics::internal::FrameData& fd) {
 	if (cmd == VK_NULL_HANDLE) return;
 
 	if (cone_dirty) {
-		std::vector<cone::Vertex> vertices;
+		std::vector<mesh::Vertex> vertices;
 		std::vector<uint16_t> indices;
 		cone::build(cone_params, vertices, indices);
-		gpu::upload(vertex_buffer, vertices.data(), vertices.size() * sizeof(cone::Vertex));
-		gpu::upload(index_buffer, indices.data(), indices.size() * sizeof(uint16_t));
-		index_count = uint32_t(indices.size());
+		uploadMesh(cone_mesh, vertices, indices);
 		cone_dirty = false;
 	}
 
 	const VkExtent2D extent = ctx.swapchain_extent;
 	const float aspect = extent.height > 0 ? float(extent.width) / float(extent.height) : 1.0f;
 
-	const mat4 view = lookAt(cameraEye(), camera.target, { 0.0f, 1.0f, 0.0f });
-	const mat4 proj = projectionMatrix(aspect);
+	const SceneData scene = {
+		.view = viewMatrix(),
+		.proj = projectionMatrix(aspect),
+		.camera_position = toVec4(camera.position, 1.0f),
+		.ambient = toVec4(srgbToLinear(ambient.color), ambient.intensity),
+		.dir_light_direction = toVec4(safeDirection(sun.direction), 0.0f),
+		.dir_light_color = toVec4(srgbToLinear(sun.color), sun.intensity),
+		.dir_light_enabled = sun.enabled ? 1u : 0u,
+		.point_light_count = uploadPointLights(),
+		.spot_light_count = uploadSpotLights(),
+	};
+	gpu::upload(scene_ubo, &scene, sizeof(scene));
 
-	for (const SceneObject& obj : objects) {
-		const UniformData data = {
-			.model = modelMatrix(obj),
-			.view = view,
-			.proj = proj,
-			.color = { srgbToLinear(obj.color.x), srgbToLinear(obj.color.y), srgbToLinear(obj.color.z), 1.0f },
-			.params = { obj.procedural_colors ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f },
-		};
-		gpu::upload(slots[obj.slot].ubo, &data, sizeof(data));
-	}
+	if (!reserveObjectBuffer(countDraws())) return;
+	next_object_index = 0;
 
 	vkResetCommandBuffer(cmd, 0);
 
@@ -688,13 +1506,13 @@ void render(const graphics::internal::FrameData& fd) {
 	vkBeginCommandBuffer(cmd, &begin);
 
 	VkClearValue clears[2] = {};
-	clears[0].color = {{0.1f, 0.2f, 0.4f, 1.0f}};
-	clears[1].depthStencil = {1.0f, 0}; 
+	clears[0].color = {{0.01f, 0.012f, 0.02f, 1.0f}};
+	clears[1].depthStencil = {1.0f, 0};
 
 	const VkRenderPassBeginInfo rp = {
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 		.renderPass = ctx.render_pass,
-		.framebuffer = fd.framebuffer, // набор картинок (цвет + глубина) под этот render pass
+		.framebuffer = fd.framebuffer,
 		.renderArea = { .offset = {0, 0}, .extent = extent },
 		.clearValueCount = 2,
 		.pClearValues = clears,
@@ -717,16 +1535,38 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdSetViewport(cmd, 0, 1, &vp);
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lit_pipeline);
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+	                        0, 1, &scene_descriptor_set, 0, nullptr);
 
-	const VkDeviceSize vertex_offset = 0;
-	vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.buffer, &vertex_offset);
-	vkCmdBindIndexBuffer(cmd, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT16);
+	pushSampling(cmd, false, 0u);
+	bindMesh(cmd, plane_mesh);
 
+	if (room.floor.visible) {
+		const float repeat = room.size / room.floor.tile_size;
+		bindObject(cmd, makeObjectData(floorModelMatrix(), room.floor.material, repeat, repeat), room.floor.material.texture);
+		vkCmdDrawIndexed(cmd, plane_mesh.index_count, 1, 0, 0, 0);
+	}
+
+	if (room.walls.visible) {
+		const float repeat_u = room.size / room.walls.tile_size;
+		const float repeat_v = room.wall_height / room.walls.tile_size;
+		for (uint32_t side = 0; side < wall_count; ++side) {
+			bindObject(cmd, makeObjectData(wallModelMatrix(side), room.walls.material, repeat_u, repeat_v),
+			           room.walls.material.texture);
+			vkCmdDrawIndexed(cmd, plane_mesh.index_count, 1, 0, 0, 0);
+		}
+	}
+
+	bindMesh(cmd, cone_mesh);
 	for (const SceneObject& obj : objects) {
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-		                        0, 1, &slots[obj.slot].descriptor_set, 0, nullptr);
-		vkCmdDrawIndexed(cmd, index_count, 1, 0, 0, 0);
+		pushSampling(cmd, obj.special_sampling, obj.sampling_seed);
+		bindObject(cmd, makeObjectData(modelMatrix(obj), obj.material), obj.material.texture);
+		vkCmdDrawIndexed(cmd, cone_mesh.index_count, 1, 0, 0, 0);
+	}
+
+	if (light_viz.enabled) {
+		drawLightMarkers(cmd);
 	}
 
 	vkCmdEndRenderPass(cmd);

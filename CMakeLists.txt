@@ -8,7 +8,9 @@ add_executable(${PROJECT_NAME}
 	source/graphics_internal.cpp
 	source/application.cpp
 	source/cone.cpp
+	source/mesh.cpp
 	source/gpu_buffer.cpp
+	source/texture.cpp
 )
 
 if(LINUX)
@@ -17,11 +19,9 @@ elseif(APPLE)
 	target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
 elseif(WIN32)
 	if(MSVC)
-		target_compile_options(${PROJECT_NAME} PRIVATE /W4 /wd4201 /utf-8) # /utf-8: исходники в UTF-8 (русские строки в UI)
-		#target_link_options(${PROJECT_NAME} PRIVATE /subsystem:windows /entry:mainCRTStartup)
+		target_compile_options(${PROJECT_NAME} PRIVATE /W4 /wd4201 /utf-8)
 	else()
 		target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
-		#target_link_options(${PROJECT_NAME} PRIVATE -mwindows)
 	endif()
 	target_compile_definitions(${PROJECT_NAME} PRIVATE -D_USE_MATH_DEFINES)
 else()
@@ -49,6 +49,12 @@ FetchContent_Declare(
 )
 
 FetchContent_Declare(
+	stb
+	GIT_REPOSITORY https://github.com/nothings/stb.git
+	GIT_TAG d14d46f6b44456eb88beac58cba833a4135d4c89
+)
+
+FetchContent_Declare(
 	imgui
 	GIT_REPOSITORY https://github.com/ocornut/imgui.git
 	GIT_TAG v1.92.9
@@ -65,6 +71,7 @@ FetchContent_MakeAvailable(
 	glfw
 	vk-bootstrap
 	VulkanMemoryAllocator
+	stb
 	imgui
 )
 
@@ -76,6 +83,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_include_directories(${PROJECT_NAME} SYSTEM PRIVATE ${stb_SOURCE_DIR})
 target_sources(${PROJECT_NAME} PRIVATE
 	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
 	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
@@ -86,10 +94,10 @@ target_sources(${PROJECT_NAME} PRIVATE
 	${imgui_SOURCE_DIR}/imgui_demo.cpp
 )
 
-# Compile shaders
 find_program(GLSLC_FOUND glslc)
 if(GLSLC_FOUND)
 	set(_SHADER_BINARIES)
+	file(GLOB _SHADER_INCLUDES ${CMAKE_SOURCE_DIR}/shaders/*.glsl)
 
 	macro(compile_shader SHADER_FILE)
 		set(SHADER_SOURCE ${CMAKE_SOURCE_DIR}/shaders/${SHADER_FILE})
@@ -99,18 +107,18 @@ if(GLSLC_FOUND)
 		add_custom_command(
 			OUTPUT ${SHADER_BINARY_PATH}
 			COMMAND glslc ${SHADER_SOURCE} -o ${SHADER_BINARY_PATH}
-			DEPENDS ${SHADER_SOURCE}
+			DEPENDS ${SHADER_SOURCE} ${_SHADER_INCLUDES}
 			COMMENT "Compiling ${SHADER_FILE} shader"
 		)
 
 		list(APPEND _SHADER_BINARIES ${SHADER_BINARY_PATH})
 	endmacro()
 
-	# To compile shader file, use compile_shader function with a file name
-	# of a shader inside shaders directory. See example below:
 
-	compile_shader(cone.vert)
-	compile_shader(cone.frag)
+	compile_shader(lighting.vert)
+	compile_shader(lighting.frag)
+	compile_shader(marker.vert)
+	compile_shader(marker.frag)
 
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)

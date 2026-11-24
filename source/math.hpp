@@ -6,14 +6,15 @@ constexpr float PI = 3.14159265358979f;
 
 inline float radians(float degrees) { return degrees * PI / 180.0f; }
 
-//Векторы
 
+struct vec2 { float x, y; };
 struct vec3 { float x, y, z; };
 struct vec4 { float x, y, z, w; };
 
 inline vec3 operator+(vec3 a, vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 inline vec3 operator-(vec3 a, vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
 inline vec3 operator*(vec3 v, float s) { return {v.x * s, v.y * s, v.z * s}; }
+inline vec3 operator-(vec3 v) { return {-v.x, -v.y, -v.z}; }
 
 inline float dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
@@ -29,6 +30,8 @@ inline vec3 normalize(vec3 v) { return v * (1.0f / length(v)); }
 inline vec4 operator+(vec4 a, vec4 b) { return {a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w}; }
 inline vec4 operator*(vec4 v, float s) { return {v.x * s, v.y * s, v.z * s, v.w * s}; }
 
+inline vec4 toVec4(vec3 v, float w) { return {v.x, v.y, v.z, w}; }
+
 
 struct mat4 { vec4 c[4]; };
 static_assert(sizeof(mat4) == 64, "mat4 должна занимать ровно 16 float подряд");
@@ -37,7 +40,32 @@ inline vec4 operator*(const mat4& m, vec4 v) {
 	return m.c[0] * v.x + m.c[1] * v.y + m.c[2] * v.z + m.c[3] * v.w;
 }
 
-// (A·B)
+struct mat3 { vec3 c[3]; };
+
+inline mat3 toMat3(const mat4& m) {
+	return {{ {m.c[0].x, m.c[0].y, m.c[0].z},
+	          {m.c[1].x, m.c[1].y, m.c[1].z},
+	          {m.c[2].x, m.c[2].y, m.c[2].z} }};
+}
+
+inline mat3 transpose(const mat3& m) {
+	return {{ {m.c[0].x, m.c[1].x, m.c[2].x},
+	          {m.c[0].y, m.c[1].y, m.c[2].y},
+	          {m.c[0].z, m.c[1].z, m.c[2].z} }};
+}
+
+inline float determinant(const mat3& m) { return dot(m.c[0], cross(m.c[1], m.c[2])); }
+
+inline mat3 inverse(const mat3& m) {
+	const float inv_det = 1.0f / determinant(m);
+	const mat3 rows = {{ cross(m.c[1], m.c[2]) * inv_det,
+	                     cross(m.c[2], m.c[0]) * inv_det,
+	                     cross(m.c[0], m.c[1]) * inv_det }};
+	return transpose(rows);
+}
+
+inline mat3 normalMatrix(const mat4& model) { return transpose(inverse(toMat3(model))); }
+
 inline mat4 operator*(const mat4& a, const mat4& b) {
 	return {{ a * b.c[0], a * b.c[1], a * b.c[2], a * b.c[3] }};
 }
@@ -49,7 +77,6 @@ inline mat4 identity() {
 	          {0, 0, 0, 1} }};  
 }
 
-//Аффинные преобразования
 
 inline mat4 translate(vec3 t) {
 	return {{ {1, 0, 0, 0},
@@ -66,7 +93,6 @@ inline mat4 scale(vec3 s) {
               {0,   0,   0,   1} }}; 
 }
 
-// Поворот вокруг Y
 inline mat4 rotateY(float a) {
 	const float c = std::cos(a), s = std::sin(a);
 	return {{ { c, 0, -s, 0},     
@@ -93,7 +119,17 @@ inline mat4 rotateZ(float a) {
               {0, 0, 0, 1} }};
 }
 
-//Проекция
+inline mat4 orientY(vec3 dir) {
+	const vec3 y = normalize(dir);
+	const vec3 helper = std::abs(y.z) < 0.99f ? vec3{ 0.0f, 0.0f, 1.0f } : vec3{ 1.0f, 0.0f, 0.0f };
+	const vec3 x = normalize(cross(y, helper));
+	const vec3 z = cross(x, y);
+	return {{ { x.x, x.y, x.z, 0 },
+	          { y.x, y.y, y.z, 0 },
+	          { z.x, z.y, z.z, 0 },
+	          { 0,   0,   0,   1 } }};
+}
+
 
 inline mat4 perspective(float fovY, float aspect, float n, float f) {
 	const float k = 1.0f / std::tan(fovY / 2.0f);

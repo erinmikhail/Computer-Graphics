@@ -5,23 +5,23 @@
 namespace trajectory {
 
 enum class Type : int {
-	Lissajous = 0, // фигура Лиссажу в 3D
-	Trefoil,       // узел-трилистник
-	Spiral,        // спираль, которая вверх-вниз
+	Lissajous = 0,
+	Trefoil,
+	Spiral,
+	Circle,
 };
 
-inline const char* const type_names[] = { "Фигура Лиссажу", "Узел-трилистник", "Спираль" };
+inline const char* const type_names[] = { "Фигура Лиссажу", "Узел-трилистник", "Спираль", "Окружность" };
 
 struct Params {
 	Type type = Type::Lissajous;
-	float radius = 1.0f; // общий размах траектории
-	float freq_a = 3.0f; // частота по X (для трилистника/спирали — множитель скорости обхода)
-	float freq_b = 2.0f; // частота по Y
-	float freq_c = 1.0f; // частота по Z
-	float phase = 0.5f;  // сдвиг фазы по X (для Лиссажу меняет форму кривой)
+	float radius = 1.0f;
+	float freq_a = 3.0f;
+	float freq_b = 2.0f;
+	float freq_c = 1.0f;
+	float phase = 0.5f;
 };
 
-// Точка траектории в момент t 
 inline vec3 evaluate(const Params& p, float t) {
 	switch (p.type) {
 	case Type::Lissajous:
@@ -46,6 +46,11 @@ inline vec3 evaluate(const Params& p, float t) {
 		         p.radius * std::sin(p.freq_b * t * 0.25f),
 		         p.radius * std::sin(s) };
 	}
+
+	case Type::Circle: {
+		const float s = p.freq_a * t;
+		return { p.radius * std::cos(s), 0.0f, p.radius * std::sin(s) };
+	}
 	}
 	return { 0.0f, 0.0f, 0.0f };
 }
@@ -55,15 +60,7 @@ inline mat4 orientationAlongPath(const Params& p, float t) {
 	const vec3 d = evaluate(p, t + eps) - evaluate(p, t);
 	if (length(d) < 1e-7f) return identity();
 
-	const vec3 y = normalize(d);
-	const vec3 helper = std::abs(y.z) < 0.99f ? vec3{ 0.0f, 0.0f, 1.0f } : vec3{ 1.0f, 0.0f, 0.0f };
-	const vec3 x = normalize(cross(y, helper));
-	const vec3 z = cross(x, y); // x × y = z — правая тройка, без отражения
-
-	return {{ { x.x, x.y, x.z, 0 },
-	          { y.x, y.y, y.z, 0 },
-	          { z.x, z.y, z.z, 0 },
-	          { 0,   0,   0,   1 } }};
+	return orientY(d);
 }
 
 }
